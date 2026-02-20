@@ -4,10 +4,13 @@ from typing import TYPE_CHECKING, Dict, Optional, TypedDict
 from venv import logger
 
 from BaseClasses import ItemClassification, Location, Region
-from worlds.evn.options import ChosenString
-from worlds.evn.regions import can_accept_location  # Is this an improper import?
+#from worlds.evn.regions import can_accept_location  # Is this an improper import?
 
 from .rezdata import misns
+from .apdata.customoutf import cust_outf_table
+from .logics import possible_regions, EVNRegionData, story_routes, EVNStoryRoute, misns_to_ignore
+
+from .apdata.offsets import offsets_table as loc_type_offset
 
 # import re
 
@@ -48,10 +51,11 @@ GAME_NAME = "EV Nova"
 # }
 
 # to add other checks, such as outfits, give them their own offset and range.
-loc_type_offset: Dict[str, int] = {
-    "misn": 2000,   # 2000 - 2999 will be missions. We have 1000 misns, so this should be safe.
-    "misn-block": 9955,
-}
+# TODO: Move all these offset dictionaries to an offset file that they will import from.
+# starting_id = 128
+# loc_type_offset: Dict[str, int] = {
+#     "misn": 2000 - starting_id,   # 2000 - 2999 will be missions. We have 791/1000 misns, so this should be safe.
+# }
 
 class EVNLocationData(TypedDict, total=False): 
     name: str
@@ -85,11 +89,22 @@ def get_locations() -> Dict[int, EVNLocationData]:
     # Missions
     for mission in misns.misn_table.keys():
         temp_mission = misns.misn_table[mission]
+        #logger.info(f"loc type offset {loc_type_offset['misn']}")
         loc_id = loc_type_offset["misn"] + (int)(temp_mission["id"]) # Probably a safer way to test this? Fails if not int somehow probably.
         #logger.info(f"creating location for mission {temp_mission['name']} with id {loc_id}. final name: {temp_mission['name'].strip() + '-' + temp_mission['id']}")
         ret_data[loc_id] = EVNLocationData(
             name=temp_mission["name"].strip() + "-" + temp_mission["id"], # adding ID to name to ensure uniqueness. We could also add the subname if we wanted, but ID is probably safer.
             address=loc_id,
+        )
+
+    # Custom outf checks
+    for coutf in cust_outf_table.keys():
+        temp_outf = cust_outf_table[coutf]
+        loc_id = loc_type_offset["outf_cks"] + (int)(temp_outf["id"])
+        logger.info(f'adding location (custom outf): {loc_id}, {temp_outf["name"]}')
+        ret_data[loc_id] = EVNLocationData(
+            name=temp_outf["name"].strip() + "-" + temp_outf["id"],
+            address=loc_id
         )
 
     return ret_data
@@ -107,6 +122,11 @@ def get_location_ids() -> Dict[str, int]:
 
 loc_name_to_id = get_location_ids()
 
+def get_location_inverted_lookup() -> Dict[int, str]:
+    global loc_name_to_id
+    return {v: k for k, v in loc_name_to_id.items()}
+
+loc_id_to_name = get_location_inverted_lookup()
 
 def get_location_names_with_ids(world: EVNWorld, location_names: list[str]) -> Dict[str, int | None]:
     # Surely there is a simpler way? This seems inefficient. 
@@ -124,65 +144,83 @@ def get_location_names_with_ids(world: EVNWorld, location_names: list[str]) -> D
 
 
 def create_all_locations(world: EVNWorld) -> None:
+    create_universe_locations(world)
     create_regular_locations(world)
     #create_events(world)
+
+    # Create universe locations - where not exists id in logic regions, add mission to temp obj. return temp obj into universe region list of locations
+
+    # Create remaining locations - just the missions listed in the chosen story line's regions. Don't add the rest - they'll be blocked in the plugin.
+
+def create_universe_locations(world: EVNWorld) -> None:
+    """
+    Populates the default universe region with all locations not used by a story string.
+    This may not technically need to be separate from create_regular_locations, but it is for now.
+    
+    :param world: the current world object being populated with data
+    :type world: EVNWorld
+    """
+    # Get our default region, "Universe", as defined in world (Other games may use a different name)
+    universe = world.get_region("Universe")
+    misn_offset = loc_type_offset["misn"]
+    coutf_offset = loc_type_offset["outf_cks"]
+
+    # Check if location used by any story regions
+    for key, loc in ev_location_bank.items():
+        loc_found = False
+
+        # cust outf - shortcut it (was added later)
+        if key > coutf_offset: # misn is 2k but outf_cks is 4k, so we know here this is an okay check
+            universe.add_locations(
+                get_location_names_with_ids(world, [loc["name"]])
+                , EVNLocation
+            )
+            continue
+
+        # misns
+        offset_key = key - misn_offset
+
+        # first, check if it is a link mission and auto-ignore
+        if offset_key in misns_to_ignore:
+            continue
+
+        # is the mission used by the storyline?
+        for rid, sreg in possible_regions.items():
+            if offset_key in sreg["missions"]:
+                loc_found = True
+                #logger.info(f"found offset {offset_key} key in {sreg['name']}")
+                break
+        
+        # if so, skip it. It is populated in the next function.
+        if loc_found:
+            continue
+
+        # If it wasn't found, add it to our default region
+        universe.add_locations(
+            get_location_names_with_ids(world, [loc["name"]])
+            , EVNLocation
+        )
+        #logger.info(f"added to universe: {key} - {offset_key} - {loc['name']}")
+
 
 
 def create_regular_locations(world: EVNWorld) -> None:
     # Finally, we need to put the Locations ("checks") into their regions.
     # Once again, before we do anything, we can grab our regions we created by using world.get_region()
-    universe = world.get_region("Universe")
+    #universe = world.get_region("Universe")
 
+    misn_offset = loc_type_offset["misn"]
 
-    # TODO: replace with looping through out mission bank
-    #for loc_name in LOCATION_NAME_TO_ID.keys():
-        # for evregion in world.get_regions():
-        #     if can_accept_location(evregion, loc_name):
-        #         evregion.add_locations(
-        #             get_location_names_with_ids(world, [loc_name])
-        #             , EVNLocation
-        #         )
-        #         break
-        # # If found above, then it should break out back to the top of this loop right?
-        # # So if we are here, we can assume that it is not a universe specific location and we can add it to universe.
-        # universe.add_locations(
-        #     get_location_names_with_ids(world, [loc_name])
-        #     , EVNLocation
-        # )
-
-    chosen_evregion = "Vellos"
-    # Default is vellos
-    match world.options.chosen_string.value:
-        case ChosenString.option_fed:
-            chosen_evregion = "Fed"
-        case ChosenString.option_rebel:
-            chosen_evregion = "Rebel"
-        case ChosenString.option_pirate:
-            chosen_evregion = "Pirate"
-        case ChosenString.option_auroran:
-            chosen_evregion = "Auroran"
-        case ChosenString.option_polaris:
-            chosen_evregion = "Polaris"
-        case _:
-            chosen_evregion = "Vellos"
-
-    for key, loc in ev_location_bank.items():
-        for evregion in world.get_regions():
-            #if can_accept_location(evregion, loc.name):
-            if can_accept_location(evregion, loc["name"]):
-                if not evregion.name == chosen_evregion:
-                    continue    #Do not add the locations where we cannot go. This will probably have breaking results for branches that share missions.
-                evregion.add_locations(
-                    get_location_names_with_ids(world, [loc["name"]])
-                    , EVNLocation
-                )
-                break
-        # If found above, then it should break out back to the top of this loop right?
-        # So if we are here, we can assume that it is not a universe specific location and we can add it to universe.
-        universe.add_locations(
-            get_location_names_with_ids(world, [loc["name"]])
-            , EVNLocation
-        )
+    chosen_route = world.get_chosen_string()
+    for key in chosen_route["regions"]:
+        sregion = possible_regions[key]
+        world_region = world.get_region(sregion["name"])
+        for misnid in sregion["missions"]:
+            loc = ev_location_bank[misnid + misn_offset]
+            world_region.add_locations(
+                get_location_names_with_ids(world, [loc["name"]])
+                , EVNLocation
+            )
 
     # I don't know how I want to handle the victory conditions yet.
     # fed_string.add_event(
